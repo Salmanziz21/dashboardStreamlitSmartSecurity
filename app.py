@@ -1,6 +1,7 @@
 # ============================================================
 #   STREAMLIT MQTT UI — PREMIUM EDITION (Super Clean Aesthetic)
 #   + IMAGE (ESP32-CAM) SUPPORT (topic: esp32/motion/gambar)
+#   + TIMEZONE INDONESIA (WIB)
 # ============================================================
 
 import streamlit as st
@@ -18,6 +19,9 @@ import base64
 from PIL import Image
 import io
 
+# timezone
+from zoneinfo import ZoneInfo
+
 # ===============================
 # CONFIG
 # ===============================
@@ -27,8 +31,8 @@ TOPIC_SENSOR = "esp32/motion/datasensor"
 TOPIC_PRED = "esp32/motion/prediction"
 TOPIC_GAMBAR = "esp32/motion/gambar"   # topic gambar (base64)
 HISTORY_MAX = 2000
-
 DEFAULT_REFRESH_MS = 1000  # ms for auto refresh
+TIMEZONE = ZoneInfo("Asia/Jakarta")   # WIB
 
 # ===============================
 # SESSION STORAGE
@@ -47,14 +51,21 @@ if "mqtt_storage" not in st.session_state:
 
 storage = st.session_state.mqtt_storage
 
+# ===============================
+# HELPER FUNCTIONS
+# ===============================
+def to_wib(dt):
+    """Convert datetime to WIB"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(TIMEZONE)
 
-# ===============================
-# MQTT HELPERS
-# ===============================
 def parse_sensor_payload(payload_str):
     try:
         data = json.loads(payload_str)
-        ts = datetime.now()
+        ts = to_wib(datetime.now())
         return {
             "timestamp": ts,
             "pir_value": int(data.get("pir_value", 0)),
@@ -62,10 +73,8 @@ def parse_sensor_payload(payload_str):
             "is_night": int(data.get("is_night", 0))
         }
     except Exception as e:
-        # tidak valid JSON
         print("parse_sensor_payload error:", e)
         return None
-
 
 def parse_prediction_payload(payload_str):
     try:
@@ -74,30 +83,23 @@ def parse_prediction_payload(payload_str):
             if "prediction" in d and isinstance(d["prediction"], dict):
                 label = d["prediction"].get("label")
                 conf = d["prediction"].get("confidence")
-                return {"timestamp": datetime.now(), "label": label, "confidence": conf}
+                return {"timestamp": to_wib(datetime.now()), "label": label, "confidence": conf}
             elif "label" in d:
-                return {"timestamp": datetime.now(), "label": d["label"], "confidence": d.get("confidence")}
+                return {"timestamp": to_wib(datetime.now()), "label": d["label"], "confidence": d.get("confidence")}
     except Exception:
-        # fallback plain text mapping
         mapping = {
             "NO MOTION DETECT": "no_motion",
             "NORMAL MOTION DETECT": "normal_motion",
             "SUSPICIOUS MOTION DETECT": "suspicious_motion"
         }
         t = payload_str.strip().upper()
-        return {"timestamp": datetime.now(), "label": mapping.get(t, t.lower()), "confidence": None}
-
+        return {"timestamp": to_wib(datetime.now()), "label": mapping.get(t, t.lower()), "confidence": None}
 
 def parse_image_payload(payload_bytes):
-    """
-    payload_bytes can be bytes of base64 string.
-    Return: PIL.Image or None
-    """
     try:
         if isinstance(payload_bytes, bytes):
             b64 = payload_bytes
         else:
-            # assume string
             b64 = payload_bytes.encode("utf-8")
         img_bytes = base64.b64decode(b64)
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -106,62 +108,44 @@ def parse_image_payload(payload_bytes):
         print("parse_image_payload error:", e)
         return None
 
-
 # ===============================
 # MQTT CALLBACKS
 # ===============================
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         storage["connected"] = True
-        # subscribe ke semua topic penting
         client.subscribe([(TOPIC_SENSOR, 0), (TOPIC_PRED, 0), (TOPIC_GAMBAR, 0)])
         print("MQTT connected and subscribed.")
     else:
         storage["connected"] = False
         print("MQTT connect failed rc=", rc)
 
-
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
-        payload = msg.payload  # keep bytes for image parsing
-        # sensor
+        payload = msg.payload
         if topic == TOPIC_SENSOR:
-            try:
-                payload_str = payload.decode("utf-8", errors="ignore")
-                item = parse_sensor_payload(payload_str)
-                if item:
-                    storage["sensors"].append(item)
-                    storage["last_sensor"] = item
-                    storage["last_update"] = datetime.now()
-            except Exception as e:
-                print("sensor decode error:", e)
-
-        # prediction
+            payload_str = payload.decode("utf-8", errors="ignore")
+            item = parse_sensor_payload(payload_str)
+            if item:
+                storage["sensors"].append(item)
+                storage["last_sensor"] = item
+                storage["last_update"] = to_wib(datetime.now())
         elif topic == TOPIC_PRED:
-            try:
-                payload_str = payload.decode("utf-8", errors="ignore")
-                pred = parse_prediction_payload(payload_str)
-                if pred:
-                    storage["predictions"].append(pred)
-                    storage["last_prediction"] = pred
-                    storage["last_update"] = datetime.now()
-            except Exception as e:
-                print("prediction decode error:", e)
-
-        # gambar (base64)
+            payload_str = payload.decode("utf-8", errors="ignore")
+            pred = parse_prediction_payload(payload_str)
+            if pred:
+                storage["predictions"].append(pred)
+                storage["last_prediction"] = pred
+                storage["last_update"] = to_wib(datetime.now())
         elif topic == TOPIC_GAMBAR:
-            # payload is base64 bytes (often large)
             img = parse_image_payload(payload)
             if img:
                 storage["last_image"] = img
-                storage["last_update"] = datetime.now()
+                storage["last_update"] = to_wib(datetime.now())
                 print("Received image from MQTT, stored in session_state.")
-            else:
-                print("Failed to parse image payload.")
     except Exception as e:
         print("on_message error:", e)
-
 
 # ===============================
 # MQTT BACKGROUND THREAD
@@ -180,67 +164,29 @@ def start_mqtt():
     client.loop_start()
     print("MQTT loop started.")
 
-
 if storage.get("client") is None:
     threading.Thread(target=start_mqtt, daemon=True).start()
     time.sleep(0.4)
 
-
 # ============================================================
-# ================     PREMIUM UI SECTION     ================
+# STREAMLIT UI
 # ============================================================
-
 st.set_page_config(page_title="ESP32 Motion Dashboard", layout="wide")
 
 st.markdown("""
 <style>
-body {
-    background-color: #0e1117;
-    color: white;
-}
-.card {
-    background: #161b22;
-    padding: 18px;
-    border-radius: 14px;
-    border: 1px solid #2d333b;
-    box-shadow: 0 4px 15px rgba(0,0,0,0.45);
-    margin-bottom: 10px;
-}
-.metric-title {
-    font-size: 14px;
-    font-weight: 600;
-    color: #9da5b4;
-    margin-bottom: 8px;
-}
-.metric-value {
-    font-size: 28px;
-    font-weight: 700;
-    margin-top: -6px;
-}
-.header {
-    background: linear-gradient(90deg, #0ea5e9, #6366f1);
-    padding: 18px;
-    border-radius: 14px;
-    margin-bottom: 12px;
-    color: white;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.25);
-}
-.small-muted {
-    color: #9da5b4;
-    font-size: 0.9rem;
-}
-.card-image {
-    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.05));
-    padding: 10px;
-    border-radius: 10px;
-}
+body {background-color: #0e1117; color: white;}
+.card {background: #161b22; padding: 18px; border-radius: 14px; border: 1px solid #2d333b; box-shadow: 0 4px 15px rgba(0,0,0,0.45); margin-bottom: 10px;}
+.metric-title {font-size: 14px; font-weight: 600; color: #9da5b4; margin-bottom: 8px;}
+.metric-value {font-size: 28px; font-weight: 700; margin-top: -6px;}
+.header {background: linear-gradient(90deg, #0ea5e9, #6366f1); padding: 18px; border-radius: 14px; margin-bottom: 12px; color: white; box-shadow: 0 4px 20px rgba(0,0,0,0.25);}
+.small-muted {color: #9da5b4; font-size: 0.9rem;}
+.card-image {background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.05)); padding: 10px; border-radius: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
-# Auto-refresh trigger
 st_autorefresh(interval=DEFAULT_REFRESH_MS)
 
-# HEADER
 st.markdown(f"""
 <div class='header'>
     <h2>📡 ESP32 AI MOTION DASHBOARD — Premium Edition</h2>
@@ -248,14 +194,15 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# --------------------------
 # TOP METRICS
+# --------------------------
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
     st.markdown("<div class='card metric-title'>🕒 Last Update</div>", unsafe_allow_html=True)
     if storage["last_update"]:
         st.markdown(f"<div class='card metric-value'>{storage['last_update'].strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='small-muted'>server time</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='small-muted'>WIB</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='card metric-value'>—</div>", unsafe_allow_html=True)
 
@@ -275,12 +222,13 @@ with col4:
 
 st.markdown("---")
 
+# --------------------------
 # MAIN CONTENT
+# --------------------------
 left, right = st.columns([2.3, 1.0])
 
-# LEFT: sensor, prediction, chart, timeline
+# LEFT
 with left:
-    # Latest sensor + prediction cards
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -289,11 +237,10 @@ with left:
             s = storage["last_sensor"]
             st.markdown(f"<div class='metric-value'>{s['pir_value']}</div>", unsafe_allow_html=True)
             st.write(f"- hour: **{s['hour']}**  \n- is_night: **{s['is_night']}**")
-            st.write(f"⏱ `{s['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}`")
+            st.write(f"⏱ `{to_wib(s['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}`")
         else:
             st.info("Belum ada data sensor.")
         st.markdown("</div>", unsafe_allow_html=True)
-
     with c2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("<div class='metric-title'>🧠 Latest Prediction</div>", unsafe_allow_html=True)
@@ -302,7 +249,7 @@ with left:
             conf = f"{p['confidence']:.2f}%" if p.get("confidence") is not None else "N/A"
             st.markdown(f"<div class='metric-value'>{p['label']}</div>", unsafe_allow_html=True)
             st.write(f"- Confidence: **{conf}**")
-            st.write(f"⏱ `{p['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}`")
+            st.write(f"⏱ `{to_wib(p['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}`")
         else:
             st.info("Belum ada prediksi.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -310,25 +257,20 @@ with left:
     # Chart
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='metric-title'>📈 Grafik PIR (Realtime)</div>", unsafe_allow_html=True)
-    if len(storage["sensors"]) > 0:
+    if storage["sensors"]:
         df = pd.DataFrame(list(storage["sensors"]))
-        if "timestamp" in df.columns:
-            df_plot = df[["timestamp", "pir_value"]].set_index("timestamp").tail(400)
-            st.line_chart(df_plot, height=300)
-        else:
-            st.info("Data timestamp tidak tersedia.")
+        df["timestamp"] = df["timestamp"].apply(to_wib)
+        df_plot = df[["timestamp", "pir_value"]].set_index("timestamp").tail(400)
+        st.line_chart(df_plot, height=300)
     else:
         st.info("Menunggu data sensor...")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Timeline events
+    # Timeline
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='metric-title'>⏳ Timeline Events (latest)</div>", unsafe_allow_html=True)
-    events = []
-    for s in storage["sensors"]:
-        events.append({"time": s["timestamp"], "event": f"PIR={s['pir_value']}"})
-    for p in storage["predictions"]:
-        events.append({"time": p["timestamp"], "event": f"PRED={p['label']}"})
+    events = [{"time": to_wib(s['timestamp']), "event": f"PIR={s['pir_value']}"} for s in storage["sensors"]]
+    events += [{"time": to_wib(p['timestamp']), "event": f"PRED={p['label']}"} for p in storage["predictions"]]
     if events:
         df_event = pd.DataFrame(events).sort_values("time").tail(200)
         st.dataframe(df_event.reset_index(drop=True), use_container_width=True, height=260)
@@ -336,37 +278,36 @@ with left:
         st.info("Belum ada event.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-# RIGHT: export, image, quick filters
+# RIGHT
 with right:
     # Export
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='metric-title'>📥 Export Data</div>", unsafe_allow_html=True)
-    if len(storage["sensors"]) > 0:
+    if storage["sensors"]:
         df_all = pd.DataFrame(list(storage["sensors"]))
-        df_all["timestamp"] = df_all["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        df_all["timestamp"] = df_all["timestamp"].apply(lambda x: to_wib(x).strftime("%Y-%m-%d %H:%M:%S"))
         csv = df_all.to_csv(index=False).encode()
         st.download_button("Download CSV Sensor", csv, "sensor_data.csv")
     else:
         st.write("Tidak ada data sensor untuk di-export.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Latest captured image (ESP32-CAM)
+    # Latest image
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='metric-title'>📸 Latest Captured Image</div>", unsafe_allow_html=True)
-    if storage.get("last_image") is not None:
+    if storage.get("last_image"):
         img = storage["last_image"]
-        # Show image with a small caption and download button
         st.image(img, caption="Gambar terbaru dari ESP32-CAM", use_column_width=True)
-        # provide download option
         buf = io.BytesIO()
         img.save(buf, format="JPEG")
-        byte_im = buf.getvalue()
-        st.download_button("Download Image (JPEG)", data=byte_im, file_name=f"esp32_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg", mime="image/jpeg")
+        st.download_button("Download Image (JPEG)", data=buf.getvalue(),
+                           file_name=f"esp32_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
+                           mime="image/jpeg")
     else:
         st.info("Belum ada gambar dari ESP32-CAM.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Quick filters / quick actions
+    # Quick filter
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='metric-title'>🔍 Quick Filter</div>", unsafe_allow_html=True)
     if st.button("Tampilkan 10 Sensor Terakhir"):
@@ -378,4 +319,4 @@ with right:
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.markdown("<div style='text-align:center; opacity:0.6'>Made with ❤️ — Premium Dashboard Edition (with ESP32-CAM image)</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center; opacity:0.6'>Made with ❤️ — Premium Dashboard Edition (WIB + ESP32-CAM)</div>", unsafe_allow_html=True)
