@@ -3,3 +3,5 @@ paho-mqtt>=1.6.1
 pandas>=2.0
 streamlit-autorefresh>=0.1.0
 numpy
+pillow
+
