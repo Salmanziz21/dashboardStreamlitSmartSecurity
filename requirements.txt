@@ -1,0 +1,5 @@
+streamlit>=1.22
+paho-mqtt>=1.6.1
+pandas>=2.0
+python-dateutil
+numpy
