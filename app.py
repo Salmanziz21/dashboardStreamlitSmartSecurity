@@ -7,6 +7,7 @@ from collections import deque
 from datetime import datetime
 import pandas as pd
 import paho.mqtt.client as mqtt
+from streamlit_autorefresh import st_autorefresh
 
 # ---------------------------
 # CONFIG
@@ -16,19 +17,23 @@ MQTT_PORT = 1883
 TOPIC_SENSOR = "esp32/motion/datasensor"
 TOPIC_PRED = "esp32/motion/prediction"
 
-HISTORY_MAX = 1000  # jumlah maksimum record historis yang disimpan
+HISTORY_MAX = 2000  # max record historis tersimpan
+
+# Default auto-refresh (ms)
+DEFAULT_REFRESH_MS = 1000
 
 # ---------------------------
-# SHARED STORAGE (thread-safe-ish)
+# SESSION STORAGE (thread-safe-ish)
 # ---------------------------
 if "mqtt_storage" not in st.session_state:
     st.session_state.mqtt_storage = {
-        "sensors": deque(maxlen=HISTORY_MAX),      # each item: {timestamp: dt, pir_value:int, hour:int, is_night:int}
-        "predictions": deque(maxlen=HISTORY_MAX),  # each item: {timestamp: dt, label:str, confidence: float (0-100) or None}
+        "sensors": deque(maxlen=HISTORY_MAX),
+        "predictions": deque(maxlen=HISTORY_MAX),
         "last_sensor": None,
         "last_prediction": None,
         "connected": False,
-        "client": None
+        "client": None,
+        "last_update": None
     }
 
 storage = st.session_state.mqtt_storage
@@ -38,24 +43,19 @@ storage = st.session_state.mqtt_storage
 # ---------------------------
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        client.connected_flag = True
         storage["connected"] = True
         client.subscribe([(TOPIC_SENSOR, 0), (TOPIC_PRED, 0)])
-        print("MQTT connected, subscribed to topics.")
+        print("MQTT connected; subscribed.")
     else:
         storage["connected"] = False
-        print("MQTT failed to connect, rc:", rc)
+        print("MQTT connect failed:", rc)
 
 def parse_sensor_payload(payload_str):
     try:
         data = json.loads(payload_str)
-        # handle if timestamp is millis from Arduino; convert to datetime now if not present or not usable
         ts = data.get("timestamp")
-        if isinstance(ts, (int, float)):
-            # assume millis since device started — better to use server time
-            dt = datetime.now()
-        else:
-            dt = datetime.now()
+        # convert to server receive time for consistency
+        dt = datetime.now()
         item = {
             "timestamp": dt,
             "pir_value": int(data.get("pir_value", 0)),
@@ -68,14 +68,10 @@ def parse_sensor_payload(payload_str):
         return None
 
 def parse_prediction_payload(payload_str):
-    # payload might be plain text like "NO MOTION DETECT" or it might be JSON
     try:
-        # try JSON first
         data = json.loads(payload_str)
         label = None
         confidence = None
-        # Common shapes:
-        # { "prediction": {"label": "...", "confidence": 90.0, ...}, "timestamp":... }
         if isinstance(data, dict):
             if "prediction" in data and isinstance(data["prediction"], dict):
                 label = data["prediction"].get("label")
@@ -83,12 +79,10 @@ def parse_prediction_payload(payload_str):
             elif "label" in data:
                 label = data.get("label")
                 confidence = data.get("confidence")
-        if label is not None:
+        if label:
             return {"timestamp": datetime.now(), "label": str(label), "confidence": float(confidence) if confidence is not None else None}
     except Exception:
-        # not JSON, treat payload as plain text
         text = payload_str.strip()
-        # Normalize known mapping used in your publisher
         mapping = {
             "NO MOTION DETECT": "no_motion",
             "NORMAL MOTION DETECT": "normal_motion",
@@ -101,21 +95,22 @@ def on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode("utf-8", errors="ignore")
     except Exception as e:
-        print("Failed decode payload:", e)
+        print("decode error:", e)
         return
 
     topic = msg.topic
-    # sensor topic -> JSON
     if topic == TOPIC_SENSOR:
         item = parse_sensor_payload(payload)
         if item:
             storage["sensors"].append(item)
             storage["last_sensor"] = item
+            storage["last_update"] = datetime.now()
     elif topic == TOPIC_PRED:
         pred = parse_prediction_payload(payload)
         if pred:
             storage["predictions"].append(pred)
             storage["last_prediction"] = pred
+            storage["last_update"] = datetime.now()
 
 # ---------------------------
 # MQTT CLIENT THREAD
@@ -124,7 +119,6 @@ def start_mqtt_client():
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connected_flag = False
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     except Exception as e:
@@ -132,159 +126,161 @@ def start_mqtt_client():
         storage["connected"] = False
         return
     storage["client"] = client
-
-    # run loop forever in background thread
     client.loop_start()
 
-# Launch MQTT client once
+# Launch MQTT once
 if storage.get("client") is None:
     mqtt_thread = threading.Thread(target=start_mqtt_client, daemon=True)
     mqtt_thread.start()
-    # give small time to attempt connection
-    time.sleep(0.5)
+    time.sleep(0.3)
 
 # ---------------------------
-# STREAMLIT UI
+# STREAMLIT UI & LAYOUT
 # ---------------------------
 st.set_page_config(page_title="ESP32 Motion Dashboard", layout="wide", initial_sidebar_state="expanded")
+st.markdown("<style> .card {background:#ffffff; padding:12px; border-radius:12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06);} .muted{color:#6c757d; font-size:0.9rem;} </style>", unsafe_allow_html=True)
 
-st.title("📡 ESP32 Motion — Dashboard (MQTT real-time)")
-st.markdown("Dashboard ini menampilkan **data sensor real-time**, **hasil prediksi model**, dan **grafik historis**.\n\nSource: MQTT topics `esp32/motion/datasensor` & `esp32/motion/prediction`.")
-
-# Sidebar: connection info & controls
+# Sidebar controls
 with st.sidebar:
-    st.header("Koneksi MQTT")
-    conn_status = "Terhubung" if storage["connected"] else "Terputus"
-    st.write(f"Broker: `{MQTT_BROKER}:{MQTT_PORT}`")
-    st.write(f"Status: **{conn_status}**")
-    st.write("Subscribed topics:")
-    st.code(TOPIC_SENSOR)
-    st.code(TOPIC_PRED)
+    st.header("Pengaturan Dashboard")
+    refresh_ms = st.slider("Auto-refresh interval (ms)", 250, 5000, DEFAULT_REFRESH_MS, step=250, help="Interval reload UI untuk menampilkan data real-time.")
     st.markdown("---")
-    st.write("Pengaturan tampilan:")
-    max_points = st.slider("Jumlah titik historis pada chart", min_value=50, max_value=HISTORY_MAX, value=300, step=50)
-    if st.button("Hapus history lokal"):
+    st.write("MQTT Broker")
+    st.text_input("Broker", value=MQTT_BROKER, key="broker_input", disabled=True)
+    st.write(f"Port: `{MQTT_PORT}`")
+    st.markdown("---")
+    st.write("Data historis")
+    history_points = st.slider("Jumlah titik historis pada chart", min_value=50, max_value=HISTORY_MAX, value=400, step=50)
+    if st.button("Bersihkan history lokal"):
         storage["sensors"].clear()
         storage["predictions"].clear()
         storage["last_sensor"] = None
         storage["last_prediction"] = None
         st.success("History dibersihkan")
 
-# Main layout: three columns
-col1, col2, col3 = st.columns([1.2, 1.2, 1.0])
+# Auto refresh trigger (uses streamlit-autorefresh)
+# returns an incrementing counter; we don't need the value except to trigger rerun
+count = st_autorefresh(interval=refresh_ms, limit=None, key="autorefresh")
 
-# Latest sensor metrics
-with col1:
-    st.subheader("Latest Sensor (real-time)")
-    last = storage["last_sensor"]
-    if last:
-        st.metric("pir_value", last["pir_value"])
-        st.metric("hour", last["hour"], delta=None)
-        st.metric("is_night", last["is_night"])
-        st.write("Terakhir diterima:", last["timestamp"].strftime("%Y-%m-%d %H:%M:%S"))
+# Header
+st.title("📡 ESP32 Motion — Dashboard (Realtime MQTT)")
+st.markdown("**Realtime monitoring** sensor PIR + hasil prediksi. Data diambil dari MQTT topics `esp32/motion/datasensor` & `esp32/motion/prediction`.")
+
+# Top status cards
+col_status_1, col_status_2, col_status_3, col_status_4 = st.columns([1.2,1.2,1.2,1.2])
+
+with col_status_1:
+    st.markdown('<div class="card"><h4>🕒 Last update</h4>', unsafe_allow_html=True)
+    last_update = storage.get("last_update")
+    if last_update:
+        st.markdown(f"**{last_update.strftime('%Y-%m-%d %H:%M:%S')}**  \n<span class='muted'>server time</span>", unsafe_allow_html=True)
     else:
-        st.info("Belum ada data sensor diterima.")
+        st.markdown("—  \n<span class='muted'>belum ada data</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # show small table of recent sensor rows
-    st.markdown("**Recent sensor rows**")
-    sensors_list = list(storage["sensors"])[-10:][::-1]
-    if sensors_list:
-        df_recent = pd.DataFrame([{
-            "time": s["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
-            "pir_value": s["pir_value"],
-            "hour": s["hour"],
-            "is_night": s["is_night"]
-        } for s in sensors_list])
-        st.dataframe(df_recent, height=220)
+with col_status_2:
+    st.markdown('<div class="card"><h4>🔌 MQTT Status</h4>', unsafe_allow_html=True)
+    status_text = "Terhubung" if storage.get("connected") else "Terputus"
+    st.markdown(f"**{status_text}**  \n<span class='muted'>broker: {MQTT_BROKER}:{MQTT_PORT}</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_status_3:
+    st.markdown('<div class="card"><h4>📊 Total sensor</h4>', unsafe_allow_html=True)
+    st.markdown(f"**{len(storage['sensors'])}**  \n<span class='muted'>rekaman tersimpan</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_status_4:
+    st.markdown('<div class="card"><h4>🧠 Total prediksi</h4>', unsafe_allow_html=True)
+    st.markdown(f"**{len(storage['predictions'])}**  \n<span class='muted'>rekaman prediksi</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("---")
+
+# Main content - two columns: left = charts/tables, right = detail/controls
+left, right = st.columns([2.4, 1.0])
+
+with left:
+    # Latest sensor & prediction in a neat row
+    s1, s2 = st.columns([1,1])
+    with s1:
+        st.subheader("Latest Sensor")
+        last = storage["last_sensor"]
+        if last:
+            st.metric("pir_value", last["pir_value"], delta=None)
+            st.write(f"- hour: **{last['hour']}**  \n- is_night: **{last['is_night']}**")
+            st.write(f"⏱ diterima: {last['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            st.info("Belum ada data sensor.")
+
+    with s2:
+        st.subheader("Latest Prediction")
+        lastp = storage["last_prediction"]
+        if lastp:
+            conf = f"{lastp['confidence']:.2f}%" if lastp.get("confidence") is not None else "N/A"
+            st.metric("Label", lastp["label"], delta=None)
+            st.write(f"- Confidence: **{conf}**")
+            st.write(f"⏱ diterima: {lastp['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            st.info("Belum ada prediksi.")
+
+    st.markdown("### Grafik Historis — pir_value")
+    if len(storage["sensors"]) == 0:
+        st.info("Menunggu data sensor...")
     else:
-        st.write("—")
+        df_plot = pd.DataFrame([{"timestamp": s["timestamp"], "pir_value": s["pir_value"]} for s in storage["sensors"]])
+        df_plot = df_plot.sort_values("timestamp").tail(history_points)
+        df_plot = df_plot.set_index("timestamp")
+        st.line_chart(df_plot["pir_value"], height=320)
 
-# Latest prediction
-with col2:
-    st.subheader("Latest Prediction (real-time)")
-    lastp = storage["last_prediction"]
-    if lastp:
-        st.metric("Label", lastp["label"])
-        conf_text = f"{lastp['confidence']:.2f}%" if lastp.get("confidence") is not None else "N/A"
-        st.metric("Confidence", conf_text)
-        st.write("Terakhir diterima:", lastp["timestamp"].strftime("%Y-%m-%d %H:%M:%S"))
+    st.markdown("### Timeline Events (gabungan sensor + prediksi)")
+    events = []
+    for s in storage["sensors"]:
+        events.append({"time": s["timestamp"], "type": "sensor", "value": s["pir_value"], "detail": ""})
+    for p in storage["predictions"]:
+        events.append({"time": p["timestamp"], "type": "prediction", "value": None, "detail": p["label"]})
+    if len(events) == 0:
+        st.write("Belum ada events.")
     else:
-        st.info("Belum ada prediksi diterima.")
+        df_events = pd.DataFrame(events).sort_values("time").tail(200)
+        st.dataframe(df_events.reset_index(drop=True), height=260)
 
-    # small list of last predictions
-    st.markdown("**Recent predictions**")
-    preds_list = list(storage["predictions"])[-10:][::-1]
-    if preds_list:
-        dfp = pd.DataFrame([{
-            "time": p["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
-            "label": p["label"],
-            "confidence": (p["confidence"] if p["confidence"] is not None else "")
-        } for p in preds_list])
-        st.dataframe(dfp, height=220)
-    else:
-        st.write("—")
-
-# Historical chart & controls
-with col3:
+with right:
     st.subheader("Kontrol & Export")
-    st.write("Download data historis (CSV)")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.write("Download data historis sensor (CSV)")
     if len(storage["sensors"]) > 0:
         df_all = pd.DataFrame([{
-            "timestamp": s["timestamp"],
+            "timestamp": s["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
             "pir_value": s["pir_value"],
             "hour": s["hour"],
             "is_night": s["is_night"]
         } for s in list(storage["sensors"])])
-
         csv = df_all.to_csv(index=False).encode("utf-8")
-        st.download_button("Download sensor CSV", csv, "sensors_history.csv", "text/csv")
+        st.download_button("Download CSV", csv, "sensors_history.csv", "text/csv")
     else:
         st.write("Belum ada data untuk di-export")
 
     st.markdown("---")
-    st.write("Informasi koneksi MQTT:")
-    st.write(f"- Client aktif: {'Ya' if storage.get('client') else 'Tidak'}")
-    st.write("- Jika tidak terhubung: periksa koneksi internet atau broker.")
+    st.write("Quick filters")
+    if st.button("Tampilkan 10 terakhir sensor"):
+        last10 = list(storage["sensors"])[-10:][::-1]
+        if last10:
+            st.table(pd.DataFrame([{
+                "time": s["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+                "pir_value": s["pir_value"],
+                "hour": s["hour"]
+            } for s in last10]))
+        else:
+            st.write("Tidak ada data")
 
-# Full-width historical chart
-st.markdown("## 📈 Grafik Historis")
-st.markdown("Grafik menampilkan `pir_value` sepanjang waktu (data server time saat diterima).")
-
-# Build DataFrame for plotting
-if len(storage["sensors"]) == 0:
-    st.info("Menunggu data sensor... pastikan ESP32 mengirim ke topic yang benar.")
-else:
-    df = pd.DataFrame([{"timestamp": s["timestamp"], "pir_value": s["pir_value"]} for s in storage["sensors"]])
-    df = df.sort_values("timestamp").tail(max_points)
-    df_plot = df.set_index("timestamp")
-    st.line_chart(df_plot["pir_value"])
-
-# Optional: show combined timeline of predictions overlay (simple)
-st.markdown("### Timeline gabungan (Sensor + Prediksi)")
-if len(storage["sensors"]) == 0 and len(storage["predictions"]) == 0:
-    st.write("Belum ada data.")
-else:
-    # create combined table of events
-    events = []
-    for s in storage["sensors"]:
-        events.append({"time": s["timestamp"], "type":"sensor", "value": s["pir_value"], "detail": ""})
-    for p in storage["predictions"]:
-        events.append({"time": p["timestamp"], "type":"prediction", "value": None, "detail": p["label"]})
-    df_events = pd.DataFrame(events).sort_values("time").tail(200)
-    # show last 50 events table
-    st.dataframe(df_events.tail(50), height=280)
-
-# Auto refresh small: use st.experimental_rerun with timer is heavy; we can ask user to use the button to start live updates
-st.markdown("---")
-cola, colb = st.columns([1,3])
-with cola:
-    if st.button("Refresh sekarang"):
-        st.experimental_rerun()
-with colb:
-    st.write("Untuk tampilan 'live', gunakan tombol Refresh sekarang sesekali atau deploy ke Streamlit Cloud yang akan mempertahankan loop MQTT di server.")
-
-st.markdown("**Catatan**: UI ini mengambil waktu server ketika pesan diterima. Jika Anda ingin sinkron waktu device, ubah payload Arduino agar mengirimkan ISO timestamp.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("Dibuat oleh Anda — integrasi Streamlit + MQTT untuk monitoring ESP32 PIR.")
+st.caption("Dashboard by you — Streamlit + MQTT (improved layout + auto-refresh)")
 
+# Footer debug (small)
+with st.expander("Debug info (raw)"):
+    st.write("Connected:", storage.get("connected"))
+    st.write("Client instance:", bool(storage.get("client")))
+    st.write("Sensors stored:", len(storage["sensors"]))
+    st.write("Predictions stored:", len(storage["predictions"]))
